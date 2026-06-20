@@ -21,9 +21,13 @@
 #      SSH admin@:2241 avec la clé de test ;
 #   7. SSH admin OK = PASS ; sinon FAIL + dump du serial.log.
 #
-# Usage : ./run.sh [--keep] [--no-data-pool]
+# Usage : ./run.sh [--keep] [--no-data-pool] [--encrypted]
 #   --keep         : ne nettoie pas (laisse disques/overlay/logs) en fin.
 #   --no-data-pool : install sans pool data (vtbd3/vtbd4 ignorés).
+#   --encrypted    : profil Option I — datasets système chiffrés (zroot/encrypted
+#                    /home,/opt,/usr/local/etc) + root clé-seule fail-safe. La
+#                    phase BOOT vérifie alors : datasets VERROUILLÉS au boot, root
+#                    joignable (porte de secours), unlock → datasets montés.
 #
 # Tout vit sous qemu/bootstrap-test/run/ (gitignore conseillé).
 # =====================================================================
@@ -94,10 +98,12 @@ PACKAGES=""   # 1er test minimal : pas de paquets supplémentaires.
 # --------------------------------------------------------------------
 KEEP=0
 DATA_POOL=1
+ENCRYPTED=0
 for arg in "$@"; do
   case "${arg}" in
     --keep)         KEEP=1 ;;
     --no-data-pool) DATA_POOL=0 ;;
+    --encrypted)    ENCRYPTED=1 ;;
     *) echo "Option inconnue : ${arg}" >&2; exit 2 ;;
   esac
 done
@@ -168,6 +174,9 @@ wait_ssh() {
 }
 
 ssh_install() { ssh "${SSH_OPTS[@]}" -p "${INSTALL_SSH_PORT}" "freebsd@127.0.0.1" "$@"; }
+# SSH dans la VM bootée. Premier arg = user (root pour la porte de secours
+# fail-safe en --encrypted, admin sinon).
+ssh_boot() { local u="$1"; shift; ssh "${SSH_OPTS[@]}" -p "${BOOT_SSH_PORT}" "${u}@127.0.0.1" "$@"; }
 
 dump_tail() {
   local f="$1" n="${2:-100}"
@@ -366,13 +375,37 @@ else
   DATA_POOLS_SCRIPT=""
 fi
 DATA_POOLS_SCRIPT_B64="$(printf '%s' "${DATA_POOLS_SCRIPT}" | base64 | tr -d '\n')"
-# Datasets système chiffrés (profil C+). Vide par défaut → install-pkgbase.sh
-# garde /home + /var/log clairs (comportement historique du banc). Le mode
-# --encrypted (à câbler) le remplira avec le script system_datasets.
+# Datasets système chiffrés (profil C+) + clés root. Vides par défaut →
+# install-pkgbase.sh garde /home + /var/log clairs et root coupé (banc
+# historique). Le mode --encrypted les remplit (profil Option I).
 SYSTEM_DATASETS_SCRIPT_B64=""
-# Clés root (Option I uniquement). Vide ici → root reste coupé (le banc
-# non-chiffré ne teste pas la porte de secours fail-safe).
 ROOT_KEYS_B64=""
+SYS_KEY_HEX=""
+if [[ "${ENCRYPTED}" -eq 1 ]]; then
+  log "Mode --encrypted : datasets système chiffrés (profil Option I)"
+  # Clé maître 64-hex (comme beryl bootstrap). On la garde côté banc pour
+  # déverrouiller en phase BOOT (équivalent de `beryl unlock` ssh_unlock).
+  SYS_KEY_HEX="$(openssl rand -hex 32)"
+  SYS_KEY_B64="$(printf '%s' "${SYS_KEY_HEX}" | base64 | tr -d '\n')"
+  # MÊME FORMAT que beryl system_datasets_script (qemu_in_rescue.cr) : le format
+  # réel est garanti par le spec unitaire ; ici on en rejoue un fidèle. La clé
+  # n'apparaît jamais en argv (base64 → $KEY → stdin de zfs create keyformat=hex).
+  SYSTEM_DATASETS_SCRIPT="$(cat <<SDS
+{
+  KEY=\$(echo '${SYS_KEY_B64}' | base64 -d)
+  printf '%s' "\$KEY" | zfs create -o encryption=on -o keyformat=hex -o keylocation=prompt -o canmount=off -o mountpoint=none ${POOL_NAME}/encrypted
+  unset KEY
+}
+zfs create -o compression=lz4 -o mountpoint=/home ${POOL_NAME}/encrypted/home
+zfs create -o compression=lz4 -o mountpoint=/opt ${POOL_NAME}/encrypted/opt
+zfs create -o compression=zstd-3 -o mountpoint=/usr/local/etc ${POOL_NAME}/encrypted/usrlocaletc
+zfs create -o compression=zstd-3 -o mountpoint=/var/log ${POOL_NAME}/zlog
+SDS
+)"
+  SYSTEM_DATASETS_SCRIPT_B64="$(printf '%s' "${SYSTEM_DATASETS_SCRIPT}" | base64 | tr -d '\n')"
+  # Porte de secours fail-safe : root clé-seule = la clé de test (dans /root clair).
+  ROOT_KEYS_B64="$(printf '%s' "${PUBKEY}" | base64 | tr -d '\n')"
+fi
 
 # sed : on utilise un délimiteur improbable (|) et on protège les valeurs
 # contenant des slashs/espaces. Les placeholders b64 ne contiennent que
@@ -484,21 +517,75 @@ start_boot
 ok "VM de boot lancée (pid $(cat "${BOOT_PID}"))"
 
 # --------------------------------------------------------------------
-# 8. Attente du SSH admin@:2241 (clé de test)
+# 8. Vérification de la VM bootée
 # --------------------------------------------------------------------
-log "Attente du SSH admin@:${BOOT_SSH_PORT} (boot + DHCP + auth, ~3 min)…"
 RESULT="FAIL"
-if wait_ssh "${BOOT_SSH_PORT}" "admin" 180; then
-  ok "SSH admin OK — le système installé boote et répond !"
-  RESULT="PASS"
-  echo "===== diagnostics dans la VM bootée ====="
-  ssh "${SSH_OPTS[@]}" -p "${BOOT_SSH_PORT}" admin@127.0.0.1 \
-    'uname -a; echo "---"; zpool status; echo "---"; (sudo -n true && echo SUDO_OK) || echo SUDO_KO' \
-    2>&1 || true
-  echo "========================================="
+if [[ "${ENCRYPTED}" -eq 1 ]]; then
+  # Profil Option I : au boot, /home est CHIFFRÉ et VERROUILLÉ (keylocation=
+  # prompt, clé larguée au reboot) → admin NE PEUT PAS se connecter (sa clé est
+  # dans /home/admin/.ssh, illisible). Seul root (clé dans /root CLAIR) répond =
+  # porte de secours fail-safe. On vérifie le verrou, on déverrouille (zfs
+  # load-key via SSH = équivalent `beryl unlock` ssh_unlock), puis on re-vérifie.
+  log "Attente du SSH root@:${BOOT_SSH_PORT} (porte de secours fail-safe, ~3 min)…"
+  if wait_ssh "${BOOT_SSH_PORT}" "root" 180; then
+    ok "SSH root OK — porte de secours fail-safe joignable (/root clair)"
+    RESULT="PASS"
+
+    # 1. Datasets VERROUILLÉS au boot.
+    KS="$(ssh_boot root "zfs get -H -o value keystatus ${POOL_NAME}/encrypted" 2>/dev/null || true)"
+    if [[ "${KS}" == "unavailable" ]]; then
+      ok "datasets chiffrés VERROUILLÉS au boot (keystatus=unavailable)"
+    else err "keystatus attendu 'unavailable', obtenu : '${KS}'"; RESULT="FAIL"; fi
+
+    # 2. root clé-seule.
+    PRL="$(ssh_boot root "grep -h PermitRootLogin /etc/ssh/sshd_config.d/10-beryl-bootstrap.conf 2>/dev/null" 2>/dev/null || true)"
+    if printf '%s' "${PRL}" | grep -q 'prohibit-password'; then
+      ok "PermitRootLogin prohibit-password (root clé-seule)"
+    else err "PermitRootLogin prohibit-password absent (obtenu : '${PRL}')"; RESULT="FAIL"; fi
+
+    # 3. /home PAS monté tant que verrouillé.
+    HM="$(ssh_boot root "zfs get -H -o value mounted ${POOL_NAME}/encrypted/home" 2>/dev/null || true)"
+    if [[ "${HM}" == "no" ]]; then
+      ok "/home non monté avant unlock (dataset chiffré verrouillé)"
+    else err "/home (mounted) attendu 'no', obtenu : '${HM}'"; RESULT="FAIL"; fi
+
+    # 4. UNLOCK : clé via stdin SSH (équivalent beryl unlock ssh_unlock).
+    log "Déverrouillage : zfs load-key via SSH (équivalent beryl unlock)…"
+    if printf '%s' "${SYS_KEY_HEX}" | ssh_boot root "zfs load-key ${POOL_NAME}/encrypted && zfs mount -a -l"; then
+      ok "unlock OK (clé chargée + zfs mount -a -l)"
+    else err "unlock a échoué"; RESULT="FAIL"; fi
+
+    # 5. Après unlock : déverrouillé + /home monté.
+    KS2="$(ssh_boot root "zfs get -H -o value keystatus ${POOL_NAME}/encrypted" 2>/dev/null || true)"
+    HM2="$(ssh_boot root "zfs get -H -o value mounted ${POOL_NAME}/encrypted/home" 2>/dev/null || true)"
+    if [[ "${KS2}" == "available" && "${HM2}" == "yes" ]]; then
+      ok "après unlock : keystatus=available + /home monté"
+    else err "après unlock : keystatus='${KS2}' (attendu available), /home='${HM2}' (attendu yes)"; RESULT="FAIL"; fi
+
+    # 6. Bonus : admin joignable maintenant que /home déchiffré est monté.
+    if wait_ssh "${BOOT_SSH_PORT}" "admin" 30; then
+      ok "admin joignable après unlock (/home déchiffré)"
+    else err "admin toujours injoignable après unlock"; RESULT="FAIL"; fi
+
+    echo "===== diagnostics (root) ====="
+    ssh_boot root 'uname -a; echo "---"; zpool status; echo "---"; zfs list -o name,mounted,keystatus' 2>&1 || true
+    echo "=============================="
+  else
+    err "pas de SSH root après 180 s — diagnostic via le serial.log :"
+    dump_tail "${BOOT_LOG}" 100
+  fi
 else
-  err "pas de SSH admin après 180 s — diagnostic via le serial.log :"
-  dump_tail "${BOOT_LOG}" 100
+  log "Attente du SSH admin@:${BOOT_SSH_PORT} (boot + DHCP + auth, ~3 min)…"
+  if wait_ssh "${BOOT_SSH_PORT}" "admin" 180; then
+    ok "SSH admin OK — le système installé boote et répond !"
+    RESULT="PASS"
+    echo "===== diagnostics dans la VM bootée ====="
+    ssh_boot admin 'uname -a; echo "---"; zpool status; echo "---"; (sudo -n true && echo SUDO_OK) || echo SUDO_KO' 2>&1 || true
+    echo "========================================="
+  else
+    err "pas de SSH admin après 180 s — diagnostic via le serial.log :"
+    dump_tail "${BOOT_LOG}" 100
+  fi
 fi
 
 # --------------------------------------------------------------------
@@ -507,8 +594,14 @@ fi
 echo
 if [[ "${RESULT}" == "PASS" ]]; then
   ok "============================================"
-  ok " BILAN : PASS — install pkgbase multi-disque"
-  ok "  → boot sur disques installés + SSH admin OK"
+  if [[ "${ENCRYPTED}" -eq 1 ]]; then
+    ok " BILAN : PASS — bootstrap Option I (chiffré)"
+    ok "  → datasets verrouillés au boot, root fail-safe,"
+    ok "    unlock → /home monté, admin joignable"
+  else
+    ok " BILAN : PASS — install pkgbase multi-disque"
+    ok "  → boot sur disques installés + SSH admin OK"
+  fi
   ok "============================================"
   EXIT=0
 else
