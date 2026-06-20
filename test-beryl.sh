@@ -107,6 +107,12 @@ cleanup_vm() {
   ssh_client "zpool destroy -f ${POOL_NAME} 2>/dev/null || true"
   ssh_client "mdconfig -d -u ${MD_UNIT} 2>/dev/null || true"
   ssh_client "rm -f ${POOL_FILE} /var/db/clevis-zfs/${POOL_NAME}.jwe"
+  # Encryptionroot jetable du test T6 (profil Option I) : détruit même si T6
+  # a planté. `-r` emporte l'enfant testhome. Absent hors T6 → no-op.
+  # ROOTPOOL peut être vide si le trap se déclenche avant la détection (phase 0).
+  if [ -n "${ROOTPOOL:-}" ]; then
+    ssh_client "zfs destroy -r ${ROOTPOOL}/encrypted 2>/dev/null || true"
+  fi
   # Purge des entrées rc.conf qu'on a posées. `sysrc -x` retire
   # une variable. On ne touche pas aux datasets enrôlés par d'autres
   # tests (testpool/zsys, testpool/zdata).
@@ -150,6 +156,17 @@ if printf '%s' "$ccz_version" | grep -q '^crystal-clevis-zfs '; then
   ok "binaire crystal-clevis-zfs installé : ${ccz_version}"
 else
   ko "binaire /usr/local/sbin/crystal-clevis-zfs absent sur la VM (lancez 21-provision-client.sh)"
+  exit 2
+fi
+
+# Nom réel du pool boot de la VM (≠ "zroot" selon l'installeur). On liste les
+# pools et on retire le pool data du banc ; ce qui reste = le pool système.
+# Utilisé par T6 (encryptionroot `${ROOTPOOL}/encrypted`) et cleanup_vm.
+ROOTPOOL="$(ssh_client "zpool list -H -o name" | grep -vx "${POOL_NAME}" | head -1)"
+if [ -n "${ROOTPOOL}" ]; then
+  ok "pool boot de la VM : ${ROOTPOOL}"
+else
+  ko "pool boot introuvable sur la VM (zpool list vide ?)"
   exit 2
 fi
 
@@ -234,7 +251,7 @@ ssh_client "zpool export ${POOL_NAME}"
 # ============================================================
 
 log "T1 — beryl unlock mode ssh_unlock"
-assert_contains "T1 unlock ssh_unlock" "terminé (1 pool(s) en ligne)" \
+assert_contains "T1 unlock ssh_unlock" "terminé (1 unité(s) en ligne)" \
   run_beryl unlock qemu/clientvm
 assert_contains "T1 dataset monté" "available" \
   ssh_client "zfs get -H -o value keystatus ${POOL_NAME}"
@@ -318,7 +335,7 @@ assert_contains "T3 unlock SSS" "3 Tangs, threshold 2" \
 log "T4 — robustesse : kill Tang #2, unlock doit toujours marcher (k=2 sur n=3)"
 ssh_tang "sudo pkill -f 'tangd -p 8889' 2>/dev/null || true"
 ssh_client "zpool export ${POOL_NAME}"
-assert_contains "T4 unlock avec 1 Tang mort" "terminé (1 pool(s) en ligne)" \
+assert_contains "T4 unlock avec 1 Tang mort" "terminé (1 unité(s) en ligne)" \
   run_beryl unlock qemu/clientvm
 
 log "T5 — ressusciter Tang #2 (cleanup pour ré-exécutions futures)"
@@ -329,5 +346,64 @@ if curl -sf --max-time 5 http://127.0.0.1:8889/adv >/dev/null; then
 else
   warn "Tang #2 ne répond pas après daemon -f — à relancer manuellement"
 fi
+
+# ============================================================
+# T6 — encryptionroot zroot (profil Option I) : unlock + status
+# ============================================================
+# Valide le maillon Option I : déverrouiller les datasets SENSIBLES du zroot
+# (`zroot/encrypted` + enfants /home,/opt,/usr/local/etc), distinct d'un pool
+# data — PAS de `zpool import` (zroot est déjà importé au boot, sshd tourne
+# dessus). On crée un encryptionroot JETABLE sur le vrai zroot de la VM, avec
+# un enfant à un mountpoint de test (jamais /home réel) ; détruit en fin de
+# test et dans cleanup_vm (filet anti-plantage).
+log "T6 — encryptionroot zroot (profil Option I, ssh_unlock)"
+
+OPTI_KEY="${BERYL_TEST_ROOT}/qemu/test/clientvm-opti.key"
+openssl rand -hex 32 > "${OPTI_KEY}"
+chmod 0400 "${OPTI_KEY}"
+
+# Host Option I : pool boot ${ROOTPOOL} avec profile standard → beryl en dérive
+# l'encryptionroot `${ROOTPOOL}/encrypted`. Même VM (127.0.0.1:2223).
+cat > "${BERYL_TEST_ROOT}/qemu/test/clientvm-opti.host.yml" <<EOF
+provider: local
+ssh_host: 127.0.0.1
+port: 2223
+user: root
+identity_file: ${BENCH_SSH_KEY}
+freebsd:
+  hostname: clientvm
+  zfs:
+    ${ROOTPOOL}:
+      boot: true
+      raid: 0
+      disks: [/dev/nvme0n1]
+      profile: standard
+      encryption:
+        mode: ssh_unlock
+EOF
+
+# Crée l'encryptionroot (canmount=off) + un enfant jetable, clé via stdin
+# (jamais en argv). On purge un éventuel résidu d'un run précédent d'abord.
+ssh_client "zfs destroy -r ${ROOTPOOL}/encrypted 2>/dev/null || true"
+cat "${OPTI_KEY}" | ssh_client \
+  "zfs create -o encryption=on -o keyformat=hex -o keylocation=prompt -o canmount=off -o mountpoint=none ${ROOTPOOL}/encrypted"
+ssh_client "zfs create -o mountpoint=/opti_test_home ${ROOTPOOL}/encrypted/testhome"
+
+# Simule l'état post-reboot : enfant démonté + clé déchargée (verrouillé).
+ssh_client "zfs unmount ${ROOTPOOL}/encrypted/testhome 2>/dev/null || true"
+ssh_client "zfs unload-key ${ROOTPOOL}/encrypted"
+
+assert_contains "T6 unlock encryptionroot ${ROOTPOOL}" "terminé (1 unité(s) en ligne)" \
+  run_beryl unlock qemu/clientvm-opti
+assert_contains "T6 clé chargée (keystatus available)" "available" \
+  ssh_client "zfs get -H -o value keystatus ${ROOTPOOL}/encrypted"
+assert_contains "T6 enfant monté après unlock" "yes" \
+  ssh_client "zfs get -H -o value mounted ${ROOTPOOL}/encrypted/testhome"
+assert_contains "T6 status = UNLOCKED" "UNLOCKED" \
+  run_beryl status qemu/clientvm-opti
+
+# Cleanup de l'encryptionroot jetable.
+ssh_client "zfs destroy -r ${ROOTPOOL}/encrypted 2>/dev/null || true"
+ok "T6 encryptionroot ${ROOTPOOL} détruit (cleanup)"
 
 log "tous les tests d'intégration sont passés"
