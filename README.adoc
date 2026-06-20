@@ -1,0 +1,253 @@
+= beryl/qemu — tests d'intégration beryl ↔ clevis-zfs
+:author: Philippe Nénert
+:revdate: 28 avril 2026
+:revnumber: 0.1
+:lang: fr
+:toc: left
+:icons: font
+:source-highlighter: rouge
+
+[.lead]
+Tests d'intégration de beryl contre une vraie VM FreeBSD chiffrée
+ZFS native + serveurs Tang. Consomment le banc QEMU du shard
+`aloli-crystal/clevis-zfs` (`prod-crystal/qemu/`, futur
+`clevis-zfs/qemu/`) — pas de duplication, juste un
+adaptateur côté beryl.
+
+== Pré-requis
+
+Le banc QEMU shard doit être démarré et provisionné. Deux options :
+
+=== Option rapide — wrapper `start-bench.sh`
+
+[source,shell]
+----
+~/prod-crystal/beryl/qemu/start-bench.sh
+----
+
+Enchaîne automatiquement les 7 scripts du shard. Idempotent.
+Ajoutez `--skip-fetch` pour sauter le download de l'image
+(utile si elle est déjà en cache).
+
+=== Option manuelle — un par un côté shard
+
+[source,shell]
+----
+cd ~/prod-crystal/qemu
+./00-fetch-image.sh           # 1ʳᵉ fois : ~10 min de download FreeBSD
+./01-prepare-disks.sh
+./10-run-tang.sh
+./11-run-client.sh
+./20-provision-tang.sh
+./21-provision-client.sh
+./22-promote-root-on-client.sh
+----
+
+=== Ce qui est démarré
+
+* VM `tang` (port SSH 2222) avec 3 instances Tang sur 8888/8889/8890.
+* VM `client` (port SSH 2223) avec :
++
+** `aloli-crystal/clevis-zfs` v0.2.0 binaire à `/usr/local/sbin/`.
+** `rc.d` du shard installé.
+** root SSH activé via la clé du banc (le script 22 fait ce
+   travail, indispensable pour beryl qui ne wrap pas ses commandes
+   en `sudo`).
+
+=== Pour arrêter
+
+[source,shell]
+----
+~/prod-crystal/beryl/qemu/stop-bench.sh         # stoppe proprement
+~/prod-crystal/beryl/qemu/stop-bench.sh --wipe  # stoppe + supprime les disques (reset complet)
+----
+
+== Utilisation
+
+Une fois le banc up, deux suites indépendantes :
+
+[source,shell]
+----
+cd ~/prod-crystal/beryl/qemu
+./test-beryl.sh        # chiffrement : unlock / tang-enroll (ZFS + Tang)
+./test-apply.sh        # moteur de recettes : primitives apply in vivo
+----
+
+Sortie attendue : suite de lignes `[ OK ]` colorées (vert) avec
+un bilan final. Code de sortie 0 si tous les tests passent.
+
+`test-apply.sh` n'a besoin que de la VM client (pas des Tangs).
+
+== Ce qui est testé
+
+Cinq scénarios end-to-end qui couvrent les flows principaux du
+chiffrement beryl (Options C et D) :
+
+[cols="1,3", options="header"]
+|===
+| # | Scénario
+
+| T1
+| `beryl unlock` mode `ssh_unlock` — clé locale via stdin SSH,
+  import + load-key + mount. Idempotence vérifiée par re-unlock.
+
+| T2
+| `beryl tang-enroll` single-Tang — bascule de `ssh_unlock` vers
+  `tang` (1 URL). Vérification : JWE écrit, keylocation restauré
+  à `prompt`, rc.conf mis à jour. Suivi d'un `beryl unlock` mode
+  tang qui doit déléguer à `clevis-zfs unlock` côté
+  serveur.
+
+| T3
+| `beryl tang-enroll` SSS multi-Tang (3 Tangs, threshold 2) — re-bind
+  qui écrase le JWE single-Tang par un JWE SSS. Suivi d'un unlock
+  qui doit reconstituer la clé via 2 Tangs (sur 3).
+
+| T4
+| Robustesse — Tang #2 tué via `pkill`. Le `beryl unlock` doit
+  toujours réussir car k=2 sur n=3 tolère 1 panne.
+
+| T5
+| Cleanup Tang #2 — relancé via `daemon -f` pour que les exécutions
+  futures du test partent sur les 3 Tangs.
+|===
+
+=== Ce qui est testé — `beryl apply` (test-apply.sh)
+
+Exerce les primitives idempotentes contre la VRAIE VM FreeBSD :
+valide la syntaxe réelle des commandes (`sysrc`, `pw`, `getent`,
+`stat`, `sha256`, `sshd -t`, `crontab`, `service`) que les specs
+unitaires ne testent que sur un `FakeShell`.
+
+[cols="1,3", options="header"]
+|===
+| Primitive | Vérification
+
+| `sysrc-set` | variable rc.conf posée (`sysrc -n`).
+| `file-write` | contenu (SHA-256), `mode` (`stat -f %Lp`), `owner` (`stat -f %Su:%Sg`).
+| `user-create` | utilisateur créé (`pw show`).
+| `user-update-keys` | clé déployée dans `authorized_keys`.
+| `sshd-config-set` | directive dans `sshd_config.d/beryl.conf` (+ `sshd -t` + reload).
+| `cron-entry` | entrée dans la crontab de root.
+| `service-enable` | lecture d'état (`sysrc -n` + `onestatus`) sur sshd (skip).
+|===
+
+Un *apply #1* applique puis vérifie l'état réel ; un *apply #2*
+prouve l'idempotence (`0 applied`). Tous les objets posés sont
+préfixés (`beryltest`, `beryl_bench`, …) et nettoyés en fin de run.
+
+[NOTE]
+====
+Volontairement EXCLUES de l'automatique (à tester à la main) :
+`pkg-install`/`pkg-remove` (réseau du guest requis) et
+`pf-rule`/`firewall-pf` (`pfctl` pourrait couper le SSH du banc).
+====
+
+Pendant les tests, un environnement beryl éphémère est créé dans
+`/tmp/beryl-test-qemu-XXXXXX/`. Il porte une fixture minimale :
+défaut `Europe/Paris`, société `qemu`, domaine `test`, host
+`clientvm` qui pointe vers `127.0.0.1:2223`. Un pool ZFS chiffré
+de test (`bdata`, 1 GB sparse sur `/dev/md10`) est créé sur la VM
+au début et détruit à la fin.
+
+== Options
+
+[cols="1,3", options="header"]
+|===
+| Flag | Effet
+
+| _(aucun)_
+| Exécution standard. Tous les tests, cleanup à la fin
+  (suppression dossier tmp et destruction du pool VM).
+
+| `--keep`
+| Conservation de l'environnement après les tests. Le dossier
+  `/tmp/beryl-test-qemu-XXXXXX/` et le pool ZFS de la VM restent
+  en place. Utile pour debug.
+
+| `--no-cleanup-vm`
+| Cleanup du dossier tmp côté Mac mais pas du pool VM. Utile pour
+  inspecter l'état de la VM sans avoir à re-provisionner.
+
+| `-h`, `--help`
+| Affiche cette aide.
+|===
+
+== Lancer aussi via Crystal spec (Option II)
+
+Le test est wrappé dans une spec Crystal taggée `:integration` :
+
+[source,shell]
+----
+crystal spec spec/integration/
+----
+
+La spec :
+
+* Skippe automatiquement (avec un message clair) si le banc QEMU
+  n'est pas joignable — pas d'échec en CI Linux.
+* Sinon, exécute `qemu/test-beryl.sh` et asserte la sortie.
+
+Pratique pour intégrer le test au workflow Crystal standard.
+
+== Architecture
+
+[source]
+----
+beryl/qemu/
+├── README.adoc                 (ce fichier)
+├── start-bench.sh              (wrapper : démarre + provisionne le banc)
+├── stop-bench.sh               (wrapper : arrête le banc, --wipe pour reset)
+├── test-beryl.sh               (5 tests beryl ↔ tang/zfs, idempotent)
+├── test-apply.sh               (tests moteur de recettes : primitives apply)
+└── lib/
+    └── assert.sh               (helpers : log, ok, ko, assert_*, ssh_client, ssh_tang, run_beryl)
+----
+
+Le script ne contient PAS le banc QEMU lui-même. La séparation
+des responsabilités est claire :
+
+* `prod-crystal/qemu/` (futur shard) — *infrastructure de test* :
+  VMs FreeBSD, instances Tang, provisionnement.
+* `beryl/qemu/` (ici) — *tests applicatifs beryl* :
+  consomment l'infra, exercent les commandes beryl.
+
+== Politique d'isolation
+
+Conformément à la règle Aloli (mémoire) :
+
+. *Chaque test est isolé*. Le pool de test (`bdata`) est nommé
+  distinctement du `testpool` du banc shard pour éviter les
+  interférences.
+. Cleanup en début ET en fin (idempotence : on peut relancer le
+  script en boucle sans dommage).
+. Le `sysrc crystal_clevis_zfs_datasets` est filtré pour retirer
+  uniquement `bdata` au cleanup, sans toucher aux datasets d'autres
+  tests qui auraient enrôlé en parallèle.
+
+== Quand l'utiliser
+
+* Avant chaque commit sensible (changement dans `Beryl::Config`,
+  `cli/unlock.cr`, `cli/reboot.cr`, `cli/status.cr`, `cli/tang_enroll.cr`,
+  `bootstrap/qemu_in_rescue.cr`).
+* Après mise à jour du shard `aloli-crystal/clevis-zfs` (vérifier
+  qu'aucune régression d'API n'est introduite).
+* Comme test de fumée d'une nouvelle release beryl.
+
+== Limites connues
+
+* Ne couvre pas le boot complet de la VM avec déverrouillage
+  automatique au boot via `rc.d`. Le shard a la même limite (cf.
+  son README). À ajouter quand le banc supportera les reboots
+  scriptés.
+* Ne teste pas `beryl bootstrap` (la VM est déjà bootée par le
+  banc). Pour tester le bootstrap, il faut un autre setup
+  (rescue + mfsBSD).
+
+== Liens
+
+* `clevis-zfs-specs.adoc` — spécification du shard consommé.
+* `boot-and-mount-plan.adoc` — schéma de partitionnement et flow boot.
+* `zpool-encryption-architecture.adoc` — décisions Options A/B/C/D.
+* `prod-crystal/qemu/` — banc QEMU (sera absorbé par
+  `clevis-zfs/qemu/`).

@@ -1,0 +1,28 @@
+# Banc QEMU — on ne versionne QUE le source (scripts .sh, README, lib/).
+# Tout le reste est généré/regénérable à chaque run.
+
+# Images FreeBSD téléchargées (00-fetch-image.sh) — lourdes.
+/images/
+
+# VMs, seeds ISO, pids, logs de boot (01-prepare-disks.sh, 1x-run-*.sh).
+/run/
+
+# Logs série/console des VMs.
+/logs/
+
+# Clés SSH de TEST, régénérées à chaque run — NE JAMAIS committer (clé privée).
+/ssh/
+
+# Banc bootstrap-test : disques raw, logs, scripts rendus, clés de test.
+/bootstrap-test/run/
+
+# Filets génériques (au cas où des artefacts traînent ailleurs).
+*.qcow2
+*.qcow2.xz
+*.iso
+*.raw
+*.pid
+*.log
+
+# macOS.
+.DS_Store
