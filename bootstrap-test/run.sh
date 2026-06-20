@@ -36,7 +36,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="${SCRIPT_DIR}/run"
 
-BERYL_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# beryl est le sibling `../../beryl` (le banc vit dans ~/prod-crystal/qemu/, pas
+# dans beryl/qemu/). Override possible via la variable d'env BERYL_ROOT.
+BERYL_ROOT="${BERYL_ROOT:-${HOME}/prod-crystal/beryl}"
 TEMPLATE="${BERYL_ROOT}/src/beryl/bootstrap/templates/install-pkgbase.sh"
 
 # Image installeur (cloud FreeBSD 15 aarch64) — NE PAS modifier : overlay.

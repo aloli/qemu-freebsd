@@ -44,7 +44,10 @@ source "${SCRIPT_DIR}/lib/assert.sh"
 BENCH_DIR="${HOME}/prod-crystal/qemu"
 BENCH_SSH_KEY="${BENCH_DIR}/ssh/id_ed25519"
 BENCH_PUB_KEY="${BENCH_DIR}/ssh/id_ed25519.pub"
-BERYL_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Le banc vit dans ~/prod-crystal/qemu/ (sibling de beryl), PAS dans beryl/qemu/.
+# `${SCRIPT_DIR}/..` pointerait donc sur ~/prod-crystal (pas de src/beryl). beryl
+# est le sibling `../beryl`. Override possible via la variable d'env BERYL_REPO.
+BERYL_REPO="${BERYL_REPO:-${HOME}/prod-crystal/beryl}"
 
 # Nom du pool ZFS de test sur la VM. Volontairement distinct du
 # `testpool` que le banc shard utilise pour son propre test 30, pour
@@ -141,10 +144,10 @@ else
   exit 2
 fi
 
-# Vérifie que clevis-zfs est installé sur la VM client.
+# Vérifie que crystal-clevis-zfs est installé sur la VM client.
 ccz_version="$(ssh_client /usr/local/sbin/crystal-clevis-zfs version 2>/dev/null || true)"
-if printf '%s' "$ccz_version" | grep -q '^clevis-zfs '; then
-  ok "binaire clevis-zfs installé : ${ccz_version}"
+if printf '%s' "$ccz_version" | grep -q '^crystal-clevis-zfs '; then
+  ok "binaire crystal-clevis-zfs installé : ${ccz_version}"
 else
   ko "binaire /usr/local/sbin/crystal-clevis-zfs absent sur la VM (lancez 21-provision-client.sh)"
   exit 2

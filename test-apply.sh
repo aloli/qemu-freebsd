@@ -46,7 +46,9 @@ source "${SCRIPT_DIR}/lib/assert.sh"
 BENCH_DIR="${HOME}/prod-crystal/qemu"
 BENCH_SSH_KEY="${BENCH_DIR}/ssh/id_ed25519"
 BENCH_PUB_KEY="${BENCH_DIR}/ssh/id_ed25519.pub"
-BERYL_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# beryl est le sibling `../beryl` (le banc vit dans ~/prod-crystal/qemu/, pas
+# dans beryl/qemu/). Override possible via la variable d'env BERYL_REPO.
+BERYL_REPO="${BERYL_REPO:-${HOME}/prod-crystal/beryl}"
 
 # Identifiants des objets de test posés sur la VM (préfixés pour un
 # cleanup ciblé sans toucher au reste).
